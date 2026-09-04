@@ -3,6 +3,6 @@
      Creating library C:\InterludeMountFix\InterludeMountFix\Release\InterludeMountFix.lib and object C:\InterludeMountFix\InterludeMountFix\Release\InterludeMountFix.exp
   Generating code
   Previous IPDB not found, fall back to full compilation.
-  All 29 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
+  All 35 functions were compiled because no usable IPDB/IOBJ from previous compilation was found.
   Finished generating code
   InterludeMountFix.vcxproj -> C:\InterludeMountFix\InterludeMountFix\Release\InterludeMountFix.dll

@@ -1,8 +1,6 @@
-// BUILD_TAG: IMF_ATTACH_SEAT_FINAL_R1
-//
 // Lineage II Interlude / Win32 x86 / Release / /MT
 //
-// Goal
+// Created by AntiVirus - L2Replica
 // ----
 // Choose the rider attachment bone per mount NPC directly from MountSeats.ini.
 //
@@ -31,14 +29,10 @@
 // For a configured mount:
 //   original Bone15 -> INI SeatBone
 //
-// No F8.
-// No GetBonePosition hook.
-// No duplicate-bone rejection.
-// No legacy CRT float parser.
-//
-// X/Y/Z are loaded and logged for INI compatibility, but this build does not
-// apply an additional local XYZ offset. The actual seat location is selected
-// by SeatBone.
+// SeatBone selects the attachment bone.
+// X/Y/Z are persistent bone-local RelativeLocation coordinates for the rider.
+//   X=0 Y=0 Z=0 -> exactly on the selected bone.
+// Non-zero XYZ moves the rider relative to that bone.
 //
 // Runtime files:
 //   MountSeats.ini
@@ -60,6 +54,18 @@
 
 typedef uint32_t FNameLite;
 
+struct FVector
+{
+    float X;
+    float Y;
+    float Z;
+};
+
+struct FMatrixRaw
+{
+    float M[4][4];
+};
+
 typedef void(__thiscall* L2FNameCtorFn)(
     FNameLite* self,
     const wchar_t* name,
@@ -70,6 +76,17 @@ typedef int(__thiscall* AttachToBoneFn)(
     void* actorToAttach,
     FNameLite bone,
     int flag);
+
+typedef void* (__thiscall* RiderEnterFn)(
+    void* self,
+    int arg1,
+    int arg2,
+    int arg3,
+    FVector location);
+
+typedef void(__thiscall* ActorLocalToWorldRawFn)(
+    void* self,
+    FMatrixRaw* outMatrix);
 
 // -----------------------------------------------------------------------------
 // Verified supplied Engine.dll
@@ -94,11 +111,55 @@ static const BYTE kAttachToBoneSig[5] =
     0x83, 0xEC, 0x0C, 0x56, 0x57
 };
 
+// ?RiderEnter@APawn@@QAEPAV1@HHHVFVector@@@Z
+static const char* kRiderEnterExport =
+"?RiderEnter@APawn@@QAEPAV1@HHHVFVector@@@Z";
+
+// Export thunk resolves to Engine base + 0x3290E0.
+static const DWORD kRiderEnterImplRva = 0x003290E0u;
+
+// Verified first 5 complete bytes:
+//   55             push ebp
+//   8D 6C 24 A0    lea  ebp,[esp-60h]
+static const BYTE kRiderEnterSig[5] =
+{
+    0x55, 0x8D, 0x6C, 0x24, 0xA0
+};
+
 static const char* kL2FNameCtorExport =
 "??0L2FName@@QAE@PBGW4EFindName@@@Z";
 
 // RiderEnter stores the normalized mount NPC ID here before AttachToBone().
 static const DWORD kRiderNpcIdOffset = 0x0000069Cu;
+
+// Verified from AActor::execSetRelativeLocation and
+// USkeletalMesh::SetAttachmentLocation in this Engine.dll.
+static const DWORD kRelativeLocationXOffset = 0x000001FCu;
+static const DWORD kRelativeLocationYOffset = 0x00000200u;
+static const DWORD kRelativeLocationZOffset = 0x00000204u;
+
+// Native AActor attachment/base state verified in Engine.dll.
+static const DWORD kActorBaseOffset = 0x00000040u;
+static const DWORD kActorBoneFNameOffset = 0x000000D8u;
+static const DWORD kActorLocationXOffset = 0x000001BCu;
+static const DWORD kActorLocationYOffset = 0x000001C0u;
+static const DWORD kActorLocationZOffset = 0x000001C4u;
+
+static const DWORD kHardAttachFlagsOffset = 0x00000214u;
+static const DWORD kHardAttachBit = 0x00000001u;
+
+// AActor::SetBase() stores HardRelMatrix (16 DWORD / 64 bytes) at +0x218.
+// FMatrix translation row M[3][0..2] therefore lives at +0x248/+24C/+250.
+static const DWORD kHardRelMatrixOffset = 0x00000218u;
+static const DWORD kHardRelTranslateXOffset = 0x00000248u;
+static const DWORD kHardRelTranslateYOffset = 0x0000024Cu;
+static const DWORD kHardRelTranslateZOffset = 0x00000250u;
+
+// ?LocalToWorld@AActor@@UBE?AVFMatrix@@XZ
+static const char* kActorLocalToWorldExport =
+"?LocalToWorld@AActor@@UBE?AVFMatrix@@XZ";
+
+static const DWORD kActorLocalToWorldImplRva = 0x000277B0u;
 
 // Original RiderEnter attachment bone in this Engine.dll.
 static const wchar_t* kOriginalRiderBoneName = L"Bone15";
@@ -122,12 +183,15 @@ struct MountPreset
     wchar_t boneNameW[128];
     FNameLite boneIndex;
 
-    // Loaded only for INI compatibility / logging in this build.
+    BOOL overrideBone;
+    // Persistent bone-local rider offset.
     float X;
     float Y;
     float Z;
 
-    volatile LONG hits;
+    volatile LONG attachHits;
+    volatile LONG xyzHits;
+    volatile LONG useNativePreset;
 };
 
 // -----------------------------------------------------------------------------
@@ -158,6 +222,11 @@ static FNameLite gOriginalRiderBone = 0;
 
 static AttachToBoneFn gOriginalAttachToBone = NULL;
 static void* gAttachTrampoline = NULL;
+
+static RiderEnterFn gOriginalRiderEnter = NULL;
+static void* gRiderEnterTrampoline = NULL;
+
+static ActorLocalToWorldRawFn gActorLocalToWorld = NULL;
 
 // -----------------------------------------------------------------------------
 // Paths / logging
@@ -753,42 +822,47 @@ static bool LoadMountConfig(
             continue;
         }
 
-        if (!temp.boneNameA[0])
-        {
-            Log(
-                "WARNING: %s enabled but SeatBone= is empty.",
-                temp.section);
 
-            continue;
+        temp.overrideBone =
+            FALSE;
+
+        temp.boneIndex =
+            gOriginalRiderBone;
+
+        if (temp.boneNameA[0])
+        {
+            if (!ToWide(
+                temp.boneNameA,
+                temp.boneNameW,
+                (int)
+                (sizeof(temp.boneNameW) /
+                    sizeof(temp.boneNameW[0]))))
+            {
+                Log(
+                    "WARNING: %s invalid SeatBone '%s'.",
+                    temp.section,
+                    temp.boneNameA);
+
+                continue;
+            }
+
+            if (!MakeFName(
+                engine,
+                temp.boneNameW,
+                &temp.boneIndex))
+            {
+                Log(
+                    "WARNING: %s could not resolve FName '%s'.",
+                    temp.section,
+                    temp.boneNameA);
+
+                continue;
+            }
+
+            temp.overrideBone =
+                TRUE;
         }
 
-        if (!ToWide(
-            temp.boneNameA,
-            temp.boneNameW,
-            (int)
-            (sizeof(temp.boneNameW) /
-                sizeof(temp.boneNameW[0]))))
-        {
-            Log(
-                "WARNING: %s invalid SeatBone '%s'.",
-                temp.section,
-                temp.boneNameA);
-
-            continue;
-        }
-
-        if (!MakeFName(
-            engine,
-            temp.boneNameW,
-            &temp.boneIndex))
-        {
-            Log(
-                "WARNING: %s could not resolve FName '%s'.",
-                temp.section,
-                temp.boneNameA);
-
-            continue;
-        }
 
         if (gMountCount >=
             kMaxMounts)
@@ -802,12 +876,13 @@ static bool LoadMountConfig(
         Log(
             "ACTIVE %s | NPC=%d | Name=%s | Mesh=%s | "
             "SeatBone=%s | FName=0x%08X | "
-            "XYZ=(%.3f, %.3f, %.3f) [XYZ reserved]",
+            "XYZ=(%.3f, %.3f, %.3f) [bone-local offset]",
             temp.section,
             temp.npcId,
             temp.codeName,
             temp.meshName,
-            temp.boneNameA,
+            temp.boneNameA[0] ? temp.boneNameA : "<empty / Engine preset>",
+            (int)temp.overrideBone,
             temp.boneIndex,
             temp.X,
             temp.Y,
@@ -869,6 +944,335 @@ static int GetMountNpcIdFromActor(
 }
 
 // -----------------------------------------------------------------------------
+// Persistent rider offset
+// -----------------------------------------------------------------------------
+// IMPORTANT: call this only AFTER original RiderEnter() returns, because
+// RiderEnter itself writes default RelativeLocation after AttachToBone().
+
+static bool ApplyRiderRelativeLocation(
+    void* riderActor,
+    const MountPreset& preset)
+{
+    if (!riderActor)
+        return false;
+
+    __try
+    {
+        *(float*)((BYTE*)riderActor + kRelativeLocationXOffset) = preset.X;
+        *(float*)((BYTE*)riderActor + kRelativeLocationYOffset) = preset.Y;
+        *(float*)((BYTE*)riderActor + kRelativeLocationZOffset) = preset.Z;
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Native hard-base preset state
+// -----------------------------------------------------------------------------
+
+static bool ReadNativePresetState(
+    void* riderActor,
+    void** baseOut,
+    DWORD* flagsOut,
+    FNameLite* boneOut,
+    FVector* relOut,
+    FVector* hardOut,
+    FVector* worldOut)
+{
+    if (baseOut) *baseOut = NULL;
+    if (flagsOut) *flagsOut = 0;
+    if (boneOut) *boneOut = 0;
+
+    if (relOut)
+    {
+        relOut->X = 0.0f;
+        relOut->Y = 0.0f;
+        relOut->Z = 0.0f;
+    }
+
+    if (hardOut)
+    {
+        hardOut->X = 0.0f;
+        hardOut->Y = 0.0f;
+        hardOut->Z = 0.0f;
+    }
+
+    if (worldOut)
+    {
+        worldOut->X = 0.0f;
+        worldOut->Y = 0.0f;
+        worldOut->Z = 0.0f;
+    }
+
+    if (!riderActor)
+        return false;
+
+    __try
+    {
+        BYTE* a = (BYTE*)riderActor;
+
+        if (baseOut)
+            *baseOut =
+            *(void**)(a + kActorBaseOffset);
+
+        if (flagsOut)
+            *flagsOut =
+            *(DWORD*)(a + kHardAttachFlagsOffset);
+
+        if (boneOut)
+            *boneOut =
+            *(FNameLite*)(a + kActorBoneFNameOffset);
+
+        if (relOut)
+        {
+            relOut->X =
+                *(float*)(a + kRelativeLocationXOffset);
+            relOut->Y =
+                *(float*)(a + kRelativeLocationYOffset);
+            relOut->Z =
+                *(float*)(a + kRelativeLocationZOffset);
+        }
+
+        if (hardOut)
+        {
+            hardOut->X =
+                *(float*)(a + kHardRelTranslateXOffset);
+            hardOut->Y =
+                *(float*)(a + kHardRelTranslateYOffset);
+            hardOut->Z =
+                *(float*)(a + kHardRelTranslateZOffset);
+        }
+
+        if (worldOut)
+        {
+            worldOut->X =
+                *(float*)(a + kActorLocationXOffset);
+            worldOut->Y =
+                *(float*)(a + kActorLocationYOffset);
+            worldOut->Z =
+                *(float*)(a + kActorLocationZOffset);
+        }
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool BuildWorldFromMountLocal(
+    void* mountActor,
+    const FVector& local,
+    FVector* worldOut)
+{
+    if (!mountActor ||
+        !worldOut ||
+        !gActorLocalToWorld)
+    {
+        return false;
+    }
+
+    __try
+    {
+        FMatrixRaw m;
+        ZeroMemory(
+            &m,
+            sizeof(m));
+
+        // The native function returns FMatrix by hidden output pointer.
+        // Raw ABI is ECX=this + one stack pointer to the output matrix.
+        gActorLocalToWorld(
+            mountActor,
+            &m);
+
+        // UE2 FMatrix uses translation row M[3].
+        worldOut->X =
+            local.X * m.M[0][0] +
+            local.Y * m.M[1][0] +
+            local.Z * m.M[2][0] +
+            m.M[3][0];
+
+        worldOut->Y =
+            local.X * m.M[0][1] +
+            local.Y * m.M[1][1] +
+            local.Z * m.M[2][1] +
+            m.M[3][1];
+
+        worldOut->Z =
+            local.X * m.M[0][2] +
+            local.Y * m.M[1][2] +
+            local.Z * m.M[2][2] +
+            m.M[3][2];
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ApplyNativePresetXYZ(
+    void* riderActor,
+    void* mountActor,
+    const MountPreset& preset,
+    FVector* oldRel,
+    FVector* oldHard,
+    FVector* oldWorld,
+    FVector* newWorld)
+{
+    if (!riderActor ||
+        !mountActor)
+    {
+        return false;
+    }
+
+    __try
+    {
+        BYTE* rider =
+            (BYTE*)riderActor;
+
+        if (oldRel)
+        {
+            oldRel->X =
+                *(float*)(rider + kRelativeLocationXOffset);
+            oldRel->Y =
+                *(float*)(rider + kRelativeLocationYOffset);
+            oldRel->Z =
+                *(float*)(rider + kRelativeLocationZOffset);
+        }
+
+        if (oldHard)
+        {
+            oldHard->X =
+                *(float*)(rider + kHardRelTranslateXOffset);
+            oldHard->Y =
+                *(float*)(rider + kHardRelTranslateYOffset);
+            oldHard->Z =
+                *(float*)(rider + kHardRelTranslateZOffset);
+        }
+
+        if (oldWorld)
+        {
+            oldWorld->X =
+                *(float*)(rider + kActorLocationXOffset);
+            oldWorld->Y =
+                *(float*)(rider + kActorLocationYOffset);
+            oldWorld->Z =
+                *(float*)(rider + kActorLocationZOffset);
+        }
+
+        // Keep the standard RelativeLocation coherent with the native preset.
+        *(float*)(rider + kRelativeLocationXOffset) =
+            preset.X;
+        *(float*)(rider + kRelativeLocationYOffset) =
+            preset.Y;
+        *(float*)(rider + kRelativeLocationZOffset) =
+            preset.Z;
+
+        // This is the native visual authority for bHardAttach actors.
+        *(float*)(rider + kHardRelTranslateXOffset) =
+            preset.X;
+        *(float*)(rider + kHardRelTranslateYOffset) =
+            preset.Y;
+        *(float*)(rider + kHardRelTranslateZOffset) =
+            preset.Z;
+
+        // Update current Location immediately as well. Future base movement
+        // is driven by the HardRelMatrix above.
+        FVector local;
+        local.X = preset.X;
+        local.Y = preset.Y;
+        local.Z = preset.Z;
+
+        FVector world;
+
+        if (BuildWorldFromMountLocal(
+            mountActor,
+            local,
+            &world))
+        {
+            *(float*)(rider + kActorLocationXOffset) =
+                world.X;
+            *(float*)(rider + kActorLocationYOffset) =
+                world.Y;
+            *(float*)(rider + kActorLocationZOffset) =
+                world.Z;
+
+            if (newWorld)
+                *newWorld = world;
+        }
+        else
+        {
+            if (newWorld)
+            {
+                newWorld->X =
+                    *(float*)(rider + kActorLocationXOffset);
+                newWorld->Y =
+                    *(float*)(rider + kActorLocationYOffset);
+                newWorld->Z =
+                    *(float*)(rider + kActorLocationZOffset);
+            }
+        }
+
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ResolveActorLocalToWorld(
+    HMODULE engine)
+{
+    BYTE* target =
+        (BYTE*)ResolveExportJump(
+            engine,
+            kActorLocalToWorldExport);
+
+    if (!target)
+    {
+        Log(
+            "ERROR: AActor::LocalToWorld export not found.");
+
+        return false;
+    }
+
+    BYTE* expected =
+        (BYTE*)engine +
+        kActorLocalToWorldImplRva;
+
+    Log(
+        "AActor::LocalToWorld implementation = %p",
+        target);
+
+    Log(
+        "Expected AActor::LocalToWorld implementation = %p",
+        expected);
+
+    if (target != expected)
+    {
+        Log(
+            "ERROR: LocalToWorld target mismatch | expected=%p actual=%p",
+            expected,
+            target);
+
+        return false;
+    }
+
+    gActorLocalToWorld =
+        (ActorLocalToWorldRawFn)target;
+
+    return true;
+}
+
+// -----------------------------------------------------------------------------
 // AttachToBone hook
 // -----------------------------------------------------------------------------
 
@@ -882,12 +1286,6 @@ static int __fastcall HookAttachToBone(
     if (!gOriginalAttachToBone)
         return 0;
 
-    FNameLite selectedBone =
-        bone;
-
-    MountPreset* preset =
-        NULL;
-
     int rawNpcId = 0;
 
     int npcId =
@@ -895,79 +1293,304 @@ static int __fastcall HookAttachToBone(
             self,
             &rawNpcId);
 
-    // RiderEnter in this supplied Engine.dll uses Bone15.
-    // Only replace that original rider-seat attachment request.
     if (npcId > 0 &&
         bone == gOriginalRiderBone)
     {
-        preset =
+        MountPreset* preset =
             FindMountPreset(
                 npcId);
 
         if (preset)
         {
-            selectedBone =
-                preset->boneIndex;
+            LONG hit =
+                InterlockedIncrement(
+                    &preset->attachHits);
+
+            // MODE B: empty SeatBone => use native hard-base preset XYZ.
+            if (!preset->overrideBone)
+            {
+                InterlockedExchange(
+                    &preset->useNativePreset,
+                    1);
+
+                if (gLogPresetHits &&
+                    hit <= gMaxInitialHitLogs)
+                {
+                    Log(
+                        "NATIVE PRESET REQUEST #%ld | NPC=%d | rawNpc=%d | "
+                        "SeatBone=<empty> | skip Bone15 | "
+                        "mountActor=%p | riderActor=%p",
+                        hit,
+                        preset->npcId,
+                        rawNpcId,
+                        self,
+                        actorToAttach);
+                }
+
+                // RiderEnter already called SetBase before AttachToBone.
+                // Keep that native hard-base state and skip bone attachment.
+                return 1;
+            }
+
+            // MODE A: try requested custom bone.
+            int result =
+                gOriginalAttachToBone(
+                    self,
+                    actorToAttach,
+                    preset->boneIndex,
+                    flag);
+
+            if (result)
+            {
+                InterlockedExchange(
+                    &preset->useNativePreset,
+                    0);
+
+                if (gLogPresetHits &&
+                    hit <= gMaxInitialHitLogs)
+                {
+                    Log(
+                        "BONE MODE #%ld | NPC=%d | rawNpc=%d | "
+                        "SeatBone=%s | FName=0x%08X | result=1",
+                        hit,
+                        preset->npcId,
+                        rawNpcId,
+                        preset->boneNameA,
+                        preset->boneIndex);
+                }
+
+                return result;
+            }
+
+            // Requested bone was not present in this mesh.
+            // Do NOT leave the actor in an unusable failed-bone state:
+            // the initial RiderEnter SetBase is still valid, so use native XYZ.
+            InterlockedExchange(
+                &preset->useNativePreset,
+                1);
+
+            if (gLogPresetHits &&
+                hit <= gMaxInitialHitLogs)
+            {
+                Log(
+                    "BONE NOT FOUND -> NATIVE PRESET #%ld | NPC=%d | rawNpc=%d | "
+                    "Requested=%s | FName=0x%08X | XYZ=(%.3f, %.3f, %.3f)",
+                    hit,
+                    preset->npcId,
+                    rawNpcId,
+                    preset->boneNameA,
+                    preset->boneIndex,
+                    preset->X,
+                    preset->Y,
+                    preset->Z);
+            }
+
+            return 1;
         }
     }
 
-    int result =
-        gOriginalAttachToBone(
+    // Enabled=0 / unconfigured / unrelated attachment: original client behavior.
+    return gOriginalAttachToBone(
+        self,
+        actorToAttach,
+        bone,
+        flag);
+}
+
+// -----------------------------------------------------------------------------
+// RiderEnter hook
+// -----------------------------------------------------------------------------
+//
+// Original signature:
+//   APawn* APawn::RiderEnter(int, int, int, FVector)
+//
+// The original returns the spawned mount actor in EAX.
+// At this point RiderEnter has already written its default RelativeLocation,
+// so NOW we apply the INI X/Y/Z to the rider pawn (self).
+//
+static void* __fastcall HookRiderEnter(
+    void* self,
+    void* /*edx*/,
+    int arg1,
+    int arg2,
+    int arg3,
+    FVector location)
+{
+    if (!gOriginalRiderEnter)
+        return NULL;
+
+    void* mountActor =
+        gOriginalRiderEnter(
             self,
-            actorToAttach,
-            selectedBone,
-            flag);
+            arg1,
+            arg2,
+            arg3,
+            location);
 
-    if (preset)
+    if (!mountActor ||
+        !self)
     {
-        LONG hit =
-            InterlockedIncrement(
-                &preset->hits);
+        return mountActor;
+    }
 
-        BOOL shouldLog =
-            FALSE;
+    int rawNpcId = 0;
 
+    int npcId =
+        GetMountNpcIdFromActor(
+            mountActor,
+            &rawNpcId);
+
+    MountPreset* preset =
+        FindMountPreset(
+            npcId);
+
+    if (!preset)
+    {
+        // Enabled=0 or not configured => original behavior untouched.
+        return mountActor;
+    }
+
+    LONG hit =
+        InterlockedIncrement(
+            &preset->xyzHits);
+
+    BOOL nativePreset =
+        InterlockedCompareExchange(
+            &preset->useNativePreset,
+            0,
+            0)
+        ? TRUE
+        : FALSE;
+
+    if (!nativePreset)
+    {
         if (gLogPresetHits &&
-            hit <=
-            gMaxInitialHitLogs)
-        {
-            shouldLog =
-                TRUE;
-        }
-
-        if (gLogPresetHits &&
-            gPeriodicHitLogEvery > 0 &&
-            (hit %
-                gPeriodicHitLogEvery) == 0)
-        {
-            shouldLog =
-                TRUE;
-        }
-
-        if (shouldLog)
+            hit <= gMaxInitialHitLogs)
         {
             Log(
-                "SEAT ATTACH #%ld | NPC=%d | rawNpc=%d | "
-                "Name=%s | Mesh=%s | "
-                "OriginalBone=Bone15(0x%08X) -> "
-                "SeatBone=%s(0x%08X) | "
-                "mountActor=%p | riderActor=%p | flag=%d | result=%d",
+                "RIDER FINAL #%ld | NPC=%d | Mode=BONE | SeatBone=%s | "
+                "client bone state preserved",
                 hit,
                 preset->npcId,
-                rawNpcId,
-                preset->codeName,
-                preset->meshName,
-                gOriginalRiderBone,
-                preset->boneNameA,
-                preset->boneIndex,
-                self,
-                actorToAttach,
-                flag,
-                result);
+                preset->boneNameA);
         }
+
+        return mountActor;
     }
 
-    return result;
+    void* baseBefore = NULL;
+    DWORD flagsBefore = 0;
+    FNameLite boneBefore = 0;
+    FVector relBefore;
+    FVector hardBefore;
+    FVector worldBefore;
+
+    ReadNativePresetState(
+        self,
+        &baseBefore,
+        &flagsBefore,
+        &boneBefore,
+        &relBefore,
+        &hardBefore,
+        &worldBefore);
+
+    FVector oldRel;
+    FVector oldHard;
+    FVector oldWorld;
+    FVector newWorld;
+
+    BOOL applied =
+        ApplyNativePresetXYZ(
+            self,
+            mountActor,
+            *preset,
+            &oldRel,
+            &oldHard,
+            &oldWorld,
+            &newWorld)
+        ? TRUE
+        : FALSE;
+
+    void* baseAfter = NULL;
+    DWORD flagsAfter = 0;
+    FNameLite boneAfter = 0;
+    FVector relAfter;
+    FVector hardAfter;
+    FVector worldAfter;
+
+    BOOL readback =
+        ReadNativePresetState(
+            self,
+            &baseAfter,
+            &flagsAfter,
+            &boneAfter,
+            &relAfter,
+            &hardAfter,
+            &worldAfter)
+        ? TRUE
+        : FALSE;
+
+    if (gLogPresetHits &&
+        hit <= gMaxInitialHitLogs)
+    {
+        Log(
+            "NATIVE PRESET XYZ #%ld | NPC=%d | rawNpc=%d | applied=%d | "
+            "BaseBefore=%p BaseAfter=%p ExpectedMount=%p | "
+            "HardAttachBefore=%d HardAttachAfter=%d | "
+            "BoneBefore=0x%08X BoneAfter=0x%08X",
+            hit,
+            preset->npcId,
+            rawNpcId,
+            (int)applied,
+            baseBefore,
+            baseAfter,
+            mountActor,
+            (flagsBefore & kHardAttachBit) ? 1 : 0,
+            (flagsAfter & kHardAttachBit) ? 1 : 0,
+            boneBefore,
+            boneAfter);
+
+        Log(
+            "NATIVE PRESET VALUES #%ld | "
+            "OldRel=(%.3f,%.3f,%.3f) OldHard=(%.3f,%.3f,%.3f) "
+            "OldWorld=(%.3f,%.3f,%.3f)",
+            hit,
+            oldRel.X,
+            oldRel.Y,
+            oldRel.Z,
+            oldHard.X,
+            oldHard.Y,
+            oldHard.Z,
+            oldWorld.X,
+            oldWorld.Y,
+            oldWorld.Z);
+
+        Log(
+            "NATIVE PRESET READBACK #%ld | "
+            "INI=(%.3f,%.3f,%.3f) "
+            "Rel=(%.3f,%.3f,%.3f) Hard=(%.3f,%.3f,%.3f) "
+            "World=(%.3f,%.3f,%.3f) CalculatedWorld=(%.3f,%.3f,%.3f) "
+            "readback=%d",
+            hit,
+            preset->X,
+            preset->Y,
+            preset->Z,
+            relAfter.X,
+            relAfter.Y,
+            relAfter.Z,
+            hardAfter.X,
+            hardAfter.Y,
+            hardAfter.Z,
+            worldAfter.X,
+            worldAfter.Y,
+            worldAfter.Z,
+            newWorld.X,
+            newWorld.Y,
+            newWorld.Z,
+            (int)readback);
+    }
+
+    return mountActor;
 }
 
 // -----------------------------------------------------------------------------
@@ -1173,6 +1796,159 @@ static bool InstallAttachHook(
     return true;
 }
 
+
+static bool InstallRiderEnterHook(
+    HMODULE engine)
+{
+    FARPROC exportStub =
+        GetProcAddress(
+            engine,
+            kRiderEnterExport);
+
+    if (!exportStub)
+    {
+        Log(
+            "ERROR: APawn::RiderEnter export not found.");
+
+        return false;
+    }
+
+    BYTE* target =
+        (BYTE*)ResolveExportJump(
+            engine,
+            kRiderEnterExport);
+
+    if (!target)
+    {
+        Log(
+            "ERROR: could not resolve RiderEnter implementation.");
+
+        return false;
+    }
+
+    BYTE* expected =
+        (BYTE*)engine +
+        kRiderEnterImplRva;
+
+    Log(
+        "RiderEnter export = %p",
+        exportStub);
+
+    Log(
+        "RiderEnter implementation = %p",
+        target);
+
+    Log(
+        "Expected RiderEnter implementation = %p",
+        expected);
+
+    if (target != expected)
+    {
+        Log(
+            "ERROR: RiderEnter target mismatch | expected=%p actual=%p",
+            expected,
+            target);
+
+        return false;
+    }
+
+    __try
+    {
+        for (int i = 0;
+            i < 5;
+            ++i)
+        {
+            if (target[i] !=
+                kRiderEnterSig[i])
+            {
+                Log(
+                    "ERROR: RiderEnter signature mismatch at byte %d | "
+                    "expected=%02X actual=%02X",
+                    i,
+                    kRiderEnterSig[i],
+                    target[i]);
+
+                return false;
+            }
+        }
+    }
+    __except (
+        EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log(
+            "ERROR: exception reading RiderEnter signature.");
+
+        return false;
+    }
+
+    gRiderEnterTrampoline =
+        BuildTrampoline(
+            target);
+
+    if (!gRiderEnterTrampoline)
+    {
+        Log(
+            "ERROR: RiderEnter trampoline allocation failed.");
+
+        return false;
+    }
+
+    gOriginalRiderEnter =
+        (RiderEnterFn)
+        gRiderEnterTrampoline;
+
+    BYTE patch[5] = { 0 };
+
+    patch[0] =
+        0xE9;
+
+    intptr_t rel =
+        (BYTE*)&HookRiderEnter -
+        (target + 5);
+
+    *(int32_t*)
+        &patch[1] =
+        (int32_t)rel;
+
+    DWORD oldProtect = 0;
+
+    if (!VirtualProtect(
+        target,
+        5,
+        PAGE_EXECUTE_READWRITE,
+        &oldProtect))
+    {
+        Log(
+            "ERROR: RiderEnter VirtualProtect failed: %lu",
+            GetLastError());
+
+        return false;
+    }
+
+    memcpy(
+        target,
+        patch,
+        sizeof(patch));
+
+    FlushInstructionCache(
+        GetCurrentProcess(),
+        target,
+        sizeof(patch));
+
+    DWORD dummy = 0;
+
+    VirtualProtect(
+        target,
+        5,
+        oldProtect,
+        &dummy);
+
+    Log(
+        "SUCCESS: APawn::RiderEnter hook installed.");
+
+    return true;
+}
+
 // -----------------------------------------------------------------------------
 // Worker
 // -----------------------------------------------------------------------------
@@ -1190,13 +1966,13 @@ static DWORD WINAPI WorkerThread(
         "InterludeMountFix - INI rider SeatBone selector");
 
     Log(
-        "Build tag = IMF_ATTACH_SEAT_FINAL_R1");
+        "Build tag = IMF_NATIVE_BONE_OR_PRESET_FINAL_R12");
 
     Log(
         "Hook = AActor::AttachToBone(FName)");
 
     Log(
-        "Mode = NPC ID -> INI SeatBone");
+        "Mode = custom bone OR native bHardAttach/HardRelMatrix preset");
 
     Log(
         "============================================================");
@@ -1294,6 +2070,15 @@ static DWORD WINAPI WorkerThread(
         return 0;
     }
 
+    if (!ResolveActorLocalToWorld(
+        engine))
+    {
+        Log(
+            "ERROR: AActor::LocalToWorld initialization failed.");
+
+        return 0;
+    }
+
     if (!InstallAttachHook(
         engine))
     {
@@ -1303,12 +2088,21 @@ static DWORD WINAPI WorkerThread(
         return 0;
     }
 
+    if (!InstallRiderEnterHook(
+        engine))
+    {
+        Log(
+            "ERROR: RiderEnter hook installation failed.");
+
+        return 0;
+    }
+
     Log(
         "READY.");
 
     Log(
-        "Configured mount RiderEnter attachments will replace Bone15 "
-        "with SeatBone from MountSeats.ini.");
+        "SeatBone is applied in AttachToBone; X/Y/Z are applied AFTER "
+        "original RiderEnter completes.");
 
     Log(
         "Duplicate SeatBone values are allowed.");
