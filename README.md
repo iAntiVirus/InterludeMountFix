@@ -1,5 +1,7 @@
 1. Create MountSeats.ini in your system
+
 2. MountSeats.ini should be like this: 
+
 ; MountSeats.ini
 ;
 ; IMF_NATIVE_BONE_OR_PRESET_FINAL_R12
@@ -34,9 +36,14 @@ SeatBone=
 X=-6.0
 Y=0.0
 Z=35.0
+
+
 3. Adapt it on engine.dll ( i did it with CFF Explorer> import table)
+
 4. After Launch the l2.exe should be created file in system with name InterludeMountFix.log
+
 5. in InterludeMountFix.log you will see this READY.
+
 [2026-09-04 12:14:37.306] ============================================================
 [2026-09-04 12:14:37.307] InterludeMountFix - INI rider SeatBone selector
 [2026-09-04 12:14:37.308] Build tag = IMF_NATIVE_BONE_OR_PRESET_FINAL_R12
@@ -79,5 +86,7 @@ Z=35.0
 [2026-09-04 12:14:38.350] Duplicate SeatBone values are allowed.
 [2026-09-04 12:14:38.351] Any positive NPC ID listed in [MountList] is supported.
 [2026-09-04 12:14:38.351] ============================================================
+
+
 
 6. After New Launch InterludeMountFix.log Delete and Create New One so InterludeMountFix.log will never be more than 5KB
